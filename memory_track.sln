@@ -1,7 +1,7 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 11.00
 # Visual Studio 2010
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "sample_layer", "sample_layer.vcxproj", "{86CF3748-B151-4F15-9972-A8D1E79E15BD}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "memory_track", "memory_track.vcxproj", "{86CF3748-B151-4F15-9972-A8D1E79E15BD}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

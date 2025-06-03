@@ -1,0 +1,21 @@
+{
+  "file_format_version" : "1.0.0",
+  "layer" : {
+    "name": "VK_LAYER_NXT_MemoryTrack",
+    "type": "GLOBAL",
+    "library_path": "./libmemory_track.so",
+    "api_version": "1.0.0",
+    "implementation_version": "1",
+    "description": "Layer to track and report Vulkan memory allocations",
+    "functions": {
+      "vkGetInstanceProcAddr": "MemoryTrack_GetInstanceProcAddr",
+      "vkGetDeviceProcAddr": "MemoryTrack_GetDeviceProcAddr"
+    },
+    "enable_environment": {
+      "ENABLE_MEMORY_TRACK": "1"
+    },
+    "disable_environment": {
+      "DISABLE_MEMORY_TRACK": "1"
+    }
+  }
+}
