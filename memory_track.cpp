@@ -3,7 +3,9 @@
 
 #include <assert.h>
 #include <string.h>
+#include <inttypes.h>
 #include <cstdio>
+#include <vector>
 
 #include <mutex>
 #include <map>
@@ -31,21 +33,31 @@ std::map<void *, VkLayerInstanceDispatchTable> instance_dispatch;
 std::map<void *, VkLayerDispatchTable> device_dispatch;
 
 // actual data we're recording in this layer
-struct MemoryUsageStats
+struct MemoryTypeInfo
 {
-  uint64_t current;
-  uint64_t maximum;
+  VkMemoryType memoryType;
+  uint64_t currentUsage;
+  uint64_t maximumUsage;
 };
 
-std::map<VkDevice, std::map<int, MemoryUsageStats>> memory_usage_stats;
-
-struct AllocationInfo
+struct MemoryHeapInfo
 {
-    VkDeviceSize allocationSize;
-    uint32_t memoryTypeIndex;
+  VkMemoryHeap memoryHeap;
+  uint64_t currentUsage;
+  uint64_t maximumUsage;
 };
 
-std::map<VkDeviceMemory, struct AllocationInfo> allocations;
+struct DeviceStats
+{
+    std::vector<MemoryTypeInfo> memoryTypes;
+    std::vector<MemoryHeapInfo> memoryHeaps;
+};
+
+std::map<VkDevice, struct DeviceStats> devices;
+
+// keep track of all allocations so we can properly account them on free
+// note that this does not perform a deep copy, so pNext chains are invalid
+std::map<VkDeviceMemory, VkMemoryAllocateInfo> allocations;
 
 ///////////////////////////////////////////////////////////////////////////////////////////
 // Layer init and shutdown
@@ -77,20 +89,24 @@ VK_LAYER_EXPORT VkResult VKAPI_CALL MemoryTrack_CreateInstance(
   PFN_vkCreateInstance createFunc = (PFN_vkCreateInstance)gpa(VK_NULL_HANDLE, "vkCreateInstance");
 
   VkResult ret = createFunc(pCreateInfo, pAllocator, pInstance);
-
-  // fetch our own dispatch table for the functions we need, into the next layer
-  VkLayerInstanceDispatchTable dispatchTable;
-  dispatchTable.GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)gpa(*pInstance, "vkGetInstanceProcAddr");
-  dispatchTable.DestroyInstance = (PFN_vkDestroyInstance)gpa(*pInstance, "vkDestroyInstance");
-  dispatchTable.EnumerateDeviceExtensionProperties = (PFN_vkEnumerateDeviceExtensionProperties)gpa(*pInstance, "vkEnumerateDeviceExtensionProperties");
-
-  // store the table by key
+  if (ret == VK_SUCCESS)
   {
-    scoped_lock l(global_lock);
-    instance_dispatch[GetKey(*pInstance)] = dispatchTable;
+
+    // fetch our own dispatch table for the functions we need, into the next layer
+    VkLayerInstanceDispatchTable dispatchTable;
+    dispatchTable.GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)gpa(*pInstance, "vkGetInstanceProcAddr");
+    dispatchTable.DestroyInstance = (PFN_vkDestroyInstance)gpa(*pInstance, "vkDestroyInstance");
+    dispatchTable.EnumerateDeviceExtensionProperties = (PFN_vkEnumerateDeviceExtensionProperties)gpa(*pInstance, "vkEnumerateDeviceExtensionProperties");
+
+    // store the table by key
+    {
+        scoped_lock l(global_lock);
+        instance_dispatch[GetKey(*pInstance)] = dispatchTable;
+    }
+
   }
 
-  return VK_SUCCESS;
+  return ret;
 }
 
 VK_LAYER_EXPORT void VKAPI_CALL MemoryTrack_DestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator)
@@ -128,39 +144,70 @@ VK_LAYER_EXPORT VkResult VKAPI_CALL MemoryTrack_CreateDevice(
   PFN_vkCreateDevice createFunc = (PFN_vkCreateDevice)gipa(VK_NULL_HANDLE, "vkCreateDevice");
 
   VkResult ret = createFunc(physicalDevice, pCreateInfo, pAllocator, pDevice);
-
-  // fetch our own dispatch table for the functions we need, into the next layer
-  VkLayerDispatchTable dispatchTable;
-  dispatchTable.GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)gdpa(*pDevice, "vkGetDeviceProcAddr");
-  dispatchTable.DestroyDevice = (PFN_vkDestroyDevice)gdpa(*pDevice, "vkDestroyDevice");
-  dispatchTable.AllocateMemory = (PFN_vkAllocateMemory)gdpa(*pDevice, "vkAllocateMemory");
-  dispatchTable.FreeMemory = (PFN_vkFreeMemory)gdpa(*pDevice, "vkFreeMemory");
-
-  // store the table by key
+  if (ret == VK_SUCCESS)
   {
-    scoped_lock l(global_lock);
-    device_dispatch[GetKey(*pDevice)] = dispatchTable;
-  }
 
-  return VK_SUCCESS;
+    // fetch our own dispatch table for the functions we need, into the next layer
+    VkLayerDispatchTable dispatchTable;
+    dispatchTable.GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)gdpa(*pDevice, "vkGetDeviceProcAddr");
+    dispatchTable.DestroyDevice = (PFN_vkDestroyDevice)gdpa(*pDevice, "vkDestroyDevice");
+    dispatchTable.AllocateMemory = (PFN_vkAllocateMemory)gdpa(*pDevice, "vkAllocateMemory");
+    dispatchTable.FreeMemory = (PFN_vkFreeMemory)gdpa(*pDevice, "vkFreeMemory");
+
+    // store the table by key
+    {
+        scoped_lock l(global_lock);
+        device_dispatch[GetKey(*pDevice)] = dispatchTable;
+    }
+
+    VkPhysicalDeviceMemoryProperties memoryProperties;
+    PFN_vkGetPhysicalDeviceMemoryProperties getMemoryProperties =
+        (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(VK_NULL_HANDLE, "vkGetPhysicalDeviceMemoryProperties");
+
+    struct DeviceStats deviceStats = {};
+    deviceStats.memoryTypes.resize(memoryProperties.memoryTypeCount);
+    deviceStats.memoryHeaps.resize(memoryProperties.memoryHeapCount);
+
+    for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; i++)
+      deviceStats.memoryTypes[i].memoryType = memoryProperties.memoryTypes[i];
+    for (uint32_t i = 0; i < memoryProperties.memoryHeapCount; i++)
+      deviceStats.memoryHeaps[i].memoryHeap = memoryProperties.memoryHeaps[i];
+
+  }
+  return ret;
 }
 
 VK_LAYER_EXPORT void VKAPI_CALL MemoryTrack_DestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator)
 {
   scoped_lock l(global_lock);
+  auto &deviceStats = devices[device];
+  uint64_t sum_device = 0, sum_host = 0;
 
-  // print summary for each memory type index
-  for (auto &stats : memory_usage_stats[device])
+  printf("Maximum usage by memory type index:\n");
+  for (int i = 0; i < deviceStats.memoryTypes.size(); i++)
   {
-    int memoryTypeIndex = stats.first;
-    MemoryUsageStats &usageStats = stats.second;
-
-    printf("Memory Type Index %d: Current Usage: %llu, Maximum Usage: %llu\n",
-           memoryTypeIndex, usageStats.current, usageStats.maximum);
+    const auto &typeInfo = deviceStats.memoryTypes[i];
+    printf(" %3d: %" PRIu64 " bytes (heap %u)\n", i,
+           (uint64_t) typeInfo.maximumUsage, typeInfo.memoryType.heapIndex);
   }
 
+  printf("Maximum usage by memory heap:\n");
+  for (int i = 0; i < deviceStats.memoryHeaps.size(); i++)
+  {
+    const auto &heapInfo = deviceStats.memoryHeaps[i];
+    printf(" %3d: %" PRIu64 " bytes\n", i, (uint64_t) heapInfo.maximumUsage);
+
+    if (heapInfo.memoryHeap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+      sum_device += heapInfo.maximumUsage;
+    else
+      sum_host += heapInfo.maximumUsage;
+  }
+
+  printf("Maximum device memory: %" PRIu64 " bytes\n", sum_device);
+  printf("Maximum host memory: %" PRIu64 " bytes\n", sum_host);
+
+  devices.erase(device);
   device_dispatch.erase(GetKey(device));
-  memory_usage_stats.erase(device);
 }
 
 VK_LAYER_EXPORT VkResult VKAPI_CALL MemoryTrack_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo* pAllocateInfo,
@@ -170,15 +217,17 @@ VK_LAYER_EXPORT VkResult VKAPI_CALL MemoryTrack_AllocateMemory(VkDevice device, 
   VkResult res = device_dispatch[GetKey(device)].AllocateMemory(device, pAllocateInfo, pAllocator, pMemory);
   if (res == VK_SUCCESS)
   {
-    AllocationInfo allocInfo;
-    allocInfo.allocationSize = pAllocateInfo->allocationSize;
-    allocInfo.memoryTypeIndex = pAllocateInfo->memoryTypeIndex;
-    allocations[*pMemory] = allocInfo;
+    allocations[*pMemory] = *pAllocateInfo;
 
-    MemoryUsageStats *stats = &memory_usage_stats[device][pAllocateInfo->memoryTypeIndex];
-    stats->current += pAllocateInfo->allocationSize;
-    if (stats->current > stats->maximum)
-      stats->maximum = stats->current;
+    auto &memoryTypeInfo = devices[device].memoryTypes[pAllocateInfo->memoryTypeIndex];
+    auto &memoryHeapInfo = devices[device].memoryHeaps[memoryTypeInfo.memoryType.heapIndex];
+
+    memoryTypeInfo.currentUsage += pAllocateInfo->allocationSize;
+    memoryHeapInfo.currentUsage += pAllocateInfo->allocationSize;
+    if (memoryTypeInfo.currentUsage > memoryTypeInfo.maximumUsage)
+      memoryTypeInfo.maximumUsage = memoryTypeInfo.currentUsage;
+    if (memoryHeapInfo.currentUsage > memoryHeapInfo.maximumUsage)
+      memoryHeapInfo.maximumUsage = memoryHeapInfo.currentUsage;
   }
 
   return res;
@@ -189,9 +238,11 @@ VK_LAYER_EXPORT void VKAPI_CALL MemoryTrack_FreeMemory(VkDevice device, VkDevice
 {
   scoped_lock l(global_lock);
 
-  AllocationInfo allocInfo = allocations[memory];
-  MemoryUsageStats *stats = &memory_usage_stats[device][allocInfo.memoryTypeIndex];
-  stats->current -= allocInfo.allocationSize;
+  const auto &allocInfo = allocations[memory];
+  auto &memoryTypeInfo = devices[device].memoryTypes[allocInfo.memoryTypeIndex];
+  auto &memoryHeapInfo = devices[device].memoryHeaps[memoryTypeInfo.memoryType.heapIndex];
+  memoryTypeInfo.currentUsage -= allocInfo.allocationSize;
+  memoryHeapInfo.currentUsage -= allocInfo.allocationSize;
   allocations.erase(memory);
 
   device_dispatch[GetKey(device)].FreeMemory(device, memory, pAllocator);
