@@ -97,6 +97,7 @@ VK_LAYER_EXPORT VkResult VKAPI_CALL MemoryTrack_CreateInstance(
     dispatchTable.GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)gpa(*pInstance, "vkGetInstanceProcAddr");
     dispatchTable.DestroyInstance = (PFN_vkDestroyInstance)gpa(*pInstance, "vkDestroyInstance");
     dispatchTable.EnumerateDeviceExtensionProperties = (PFN_vkEnumerateDeviceExtensionProperties)gpa(*pInstance, "vkEnumerateDeviceExtensionProperties");
+    dispatchTable.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)gpa(*pInstance, "vkGetPhysicalDeviceMemoryProperties");
 
     // store the table by key
     {
@@ -161,18 +162,18 @@ VK_LAYER_EXPORT VkResult VKAPI_CALL MemoryTrack_CreateDevice(
     }
 
     VkPhysicalDeviceMemoryProperties memoryProperties;
-    PFN_vkGetPhysicalDeviceMemoryProperties getMemoryProperties =
-        (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(VK_NULL_HANDLE, "vkGetPhysicalDeviceMemoryProperties");
+    auto &instanceDispatch = instance_dispatch[GetKey(physicalDevice)];
+    instanceDispatch.GetPhysicalDeviceMemoryProperties(physicalDevice, &memoryProperties);
 
     struct DeviceStats deviceStats = {};
     deviceStats.memoryTypes.resize(memoryProperties.memoryTypeCount);
     deviceStats.memoryHeaps.resize(memoryProperties.memoryHeapCount);
-
     for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; i++)
       deviceStats.memoryTypes[i].memoryType = memoryProperties.memoryTypes[i];
     for (uint32_t i = 0; i < memoryProperties.memoryHeapCount; i++)
       deviceStats.memoryHeaps[i].memoryHeap = memoryProperties.memoryHeaps[i];
 
+    devices[*pDevice] = deviceStats;
   }
   return ret;
 }
@@ -187,6 +188,9 @@ VK_LAYER_EXPORT void VKAPI_CALL MemoryTrack_DestroyDevice(VkDevice device, const
   for (int i = 0; i < deviceStats.memoryTypes.size(); i++)
   {
     const auto &typeInfo = deviceStats.memoryTypes[i];
+    if (typeInfo.maximumUsage == 0)
+      continue;
+
     printf(" %3d: %" PRIu64 " bytes (heap %u)\n", i,
            (uint64_t) typeInfo.maximumUsage, typeInfo.memoryType.heapIndex);
   }
@@ -195,8 +199,10 @@ VK_LAYER_EXPORT void VKAPI_CALL MemoryTrack_DestroyDevice(VkDevice device, const
   for (int i = 0; i < deviceStats.memoryHeaps.size(); i++)
   {
     const auto &heapInfo = deviceStats.memoryHeaps[i];
-    printf(" %3d: %" PRIu64 " bytes\n", i, (uint64_t) heapInfo.maximumUsage);
+    if (heapInfo.maximumUsage == 0)
+      continue;
 
+    printf(" %3d: %" PRIu64 " bytes\n", i, (uint64_t) heapInfo.maximumUsage);
     if (heapInfo.memoryHeap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
       sum_device += heapInfo.maximumUsage;
     else
